@@ -4,6 +4,7 @@ local M = {}
 -- 保存会话状态
 local state = {
   flying_make_job_id = nil,
+  flying_test_job_id = nil,
 }
 
 -- 导入配置模块
@@ -134,6 +135,63 @@ local function do_make(opts)
   })
 end
 
+-- 执行测试命令的核心函数
+local function run_test(opts)
+  if not opts.container_name or not opts.build_dir or not opts.target then
+    vim.notify("Missing required parameters for running test", vim.log.levels.ERROR)
+    return
+  end
+
+  -- 创建一个新的空buffer
+  local buf = vim.api.nvim_create_buf(false, true)
+  -- vim.api.nvim_buf_set_name(buf, string.format("[Test Output - %s]", opts.target))
+
+  -- 打开一个新窗口显示buffer
+  vim.cmd('vnew')
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
+
+  -- 添加标题行
+  local title = string.format("Running test: %s", opts.target)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { title, string.rep("=", #title), "" })
+
+  -- 构建测试命令
+  local run_cmd = string.format(
+    'bash -c "cd %s; ctest -R %s -V"',
+    opts.build_dir,
+    opts.target
+  )
+
+  print(string.format("exec test cmd: %s", run_cmd))
+
+  -- 执行测试命令并将输出定向到buffer
+  state.flying_test_job_id = vim.fn.jobstart(run_cmd, {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      if data then
+        vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        -- 滚动到最新内容
+        vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+      end
+    end,
+    on_stderr = function(_, data)
+      if data then
+        vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        -- 滚动到最新内容
+        vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+      end
+    end,
+    on_exit = function(_, exit_code)
+      state.flying_test_job_id = nil
+      local status_line = string.format("Test finished with exit code: %d", exit_code)
+      vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "", status_line })
+      vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+      print(status_line)
+    end
+  })
+end
+
 local function get_or_prompt_config(callback)
   -- 检查配置文件是否存在
   if config.config_file_exists() then
@@ -241,6 +299,37 @@ local function get_or_prompt_config(callback)
   end)
 end
 
+-- 公共函数：获取可用的测试目标列表
+local function get_test_targets(container_name, build_dir, callback)
+  local cmd = string.format("docker exec %s bash -c 'cd %s; ctest -N'", container_name, build_dir)
+  local output = vim.fn.system(cmd)
+  local exit_code = vim.v.shell_error
+
+  if exit_code ~= 0 then
+    print(string.format("get test targets failed, exit_code:%d output:%s", exit_code, output))
+    vim.notify("Failed to get test targets", vim.log.levels.ERROR)
+    callback(nil)
+    return
+  end
+
+  -- 解析输出，提取所有的测试目标
+  local targets = {}
+  for line in output:gmatch("[^\n]+") do
+    local target = line:match("^%s*Test%s+#[%d]+:%s+([%w_.-]+)")
+    if target then
+      table.insert(targets, target)
+    end
+  end
+
+  if #targets == 0 then
+    vim.notify("No test targets found", vim.log.levels.WARN)
+    callback(nil)
+    return
+  end
+
+  callback(targets)
+end
+
 -- 提取执行 MakeSelect 逻辑的函数
 local function execute_make_select(container_name, root_path)
   local cmd = string.format("docker exec %s bash -c 'cd %s; cmake --build . --target help'", container_name, root_path)
@@ -269,7 +358,7 @@ local function execute_make_select(container_name, root_path)
 
   -- 使用 vim.ui.select 供用户选择
   vim.ui.select(targets, {
-    prompt = "Choose target",
+    prompt = "Choose build target",
   }, function(choice)
     if choice then
       do_make({
@@ -286,6 +375,27 @@ local function execute_make_select(container_name, root_path)
         end
       end)
     end
+  end)
+end
+
+-- 执行测试选择逻辑的函数
+local function execute_test_select(container_name, build_dir)
+  get_test_targets(container_name, build_dir, function(targets)
+    if not targets then
+      return
+    end
+
+    vim.ui.select(targets, {
+      prompt = "Choose test target",
+    }, function(choice)
+      if choice then
+        run_test({
+          container_name = container_name,
+          build_dir = build_dir,
+          target = choice
+        })
+      end
+    end)
   end)
 end
 
@@ -379,20 +489,107 @@ M.setup = function(opts)
     nargs = '*'
   })
 
+  -- 注册 :MakeRun 命令
+  vim.api.nvim_create_user_command("MakeRun", function(opts)
+    if state.flying_test_job_id and vim.fn.jobwait({ state.flying_test_job_id }, 0)[1] == -1 then
+      vim.notify('There is already a test job running with ID: ' .. state.flying_test_job_id, vim.log.levels.ERROR)
+      return
+    end
+
+    -- 设置参数
+    local args = vim.split(opts.args, ' ', { trimempty = true })
+
+    -- 如果没有提供参数，尝试从配置文件获取
+    if #args == 0 then
+      get_or_prompt_config(function(cfg)
+        if not cfg then
+          return
+        end
+
+        local container_name = cfg.container_name
+        local build_dir = cfg.build_dir
+        local target = cfg.target
+
+        if target and target ~= "" then
+          -- 使用现有配置直接运行测试
+          run_test({
+            container_name = container_name,
+            build_dir = build_dir,
+            target = target
+          })
+        else
+          -- 目标为空，触发目标选择流程
+          execute_test_select(container_name, build_dir)
+        end
+      end)
+      return
+    end
+
+    -- 处理提供了参数的情况
+    local container_name, build_dir, target
+
+    if #args >= 2 then
+      container_name = args[1]
+      build_dir = args[2]
+      target = #args > 2 and table.concat(args, ' ', 3) or ""
+    else
+      vim.notify('MakeRun command requires at least 2 arguments: container_name and build_dir', vim.log.levels.ERROR)
+      return
+    end
+
+    -- 处理相对路径
+    if build_dir:sub(1, 1) ~= '/' then
+      local cwd = vim.fn.getcwd()
+      build_dir = cwd .. '/' .. build_dir
+    end
+
+    if not target or target == "" then
+      -- 有目录但没有指定目标，列出可用测试目标
+      execute_test_select(container_name, build_dir)
+    else
+      -- 直接运行指定目标
+      run_test({
+        container_name = container_name,
+        build_dir = build_dir,
+        target = target
+      })
+    end
+  end, {
+    nargs = '*',
+    desc = "Run tests using ctest -R <target> -V"
+  })
+
   -- 注册 :KillMake 命令
   vim.api.nvim_create_user_command('KillMake', function(opts)
+    local jobs_killed = false
+
     if state.flying_make_job_id and vim.fn.jobwait({ state.flying_make_job_id }, 0)[1] == -1 then
       -- 终止 Neovim 作业本身
       vim.fn.jobstop(state.flying_make_job_id)
-      vim.notify('Job with ID ' .. state.flying_make_job_id .. ' has been killed', vim.log.levels.INFO)
+      vim.notify('Build job with ID ' .. state.flying_make_job_id .. ' has been killed', vim.log.levels.INFO)
       state.flying_make_job_id = nil
+      jobs_killed = true
     end
 
-    -- 终止容器内的编译进程
+    if state.flying_test_job_id and vim.fn.jobwait({ state.flying_test_job_id }, 0)[1] == -1 then
+      -- 终止测试作业
+      vim.fn.jobstop(state.flying_test_job_id)
+      vim.notify('Test job with ID ' .. state.flying_test_job_id .. ' has been killed', vim.log.levels.INFO)
+      state.flying_test_job_id = nil
+      jobs_killed = true
+    end
+
+    if not jobs_killed then
+      vim.notify('No active build or test jobs found', vim.log.levels.INFO)
+    end
+
+    -- 终止容器内的编译/测试进程
     local commands_to_kill = {
       "bash -c",
       "ld",
-      "cc1plus"
+      "cc1plus",
+      "ctest",
+      "cmake"
     }
 
     local container_name = nil
@@ -420,7 +617,7 @@ M.setup = function(opts)
   end, {
     nargs = "?",
     -- 命令的描述
-    desc = 'Kill the currently running Make job'
+    desc = 'Kill the currently running Make or test job'
   })
 end
 
