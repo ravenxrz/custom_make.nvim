@@ -170,16 +170,24 @@ local function run_test(opts)
     stderr_buffered = false,
     on_stdout = function(_, data)
       if data then
-        vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        if vim.api.nvim_buf_is_valid(buf) then
+          vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        end
         -- 滚动到最新内容
-        vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+        end
       end
     end,
     on_stderr = function(_, data)
       if data then
-        vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        if vim.api.nvim_buf_is_valid(buf) then
+          vim.api.nvim_buf_set_lines(buf, -1, -1, false, data)
+        end
         -- 滚动到最新内容
-        vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
+        end
       end
     end,
     on_exit = function(_, exit_code)
