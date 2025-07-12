@@ -63,31 +63,40 @@ end
 -- 执行 make 命令的核心函数
 local function do_make(opts)
   -- 如果没有提供参数，则尝试从配置文件获取
-  if not opts.container_name or not opts.build_dir then
-    local cfg = get_or_prompt_config()
-    if not cfg then
+  if not opts.build_dir then
+    get_or_prompt_config(function(cfg)
+      if not cfg then
+        return
+      end
+      opts.container_name = cfg.container_name
+      opts.build_dir = cfg.build_dir
+      opts.target = cfg.target
+    end)
+    if not opts.build_dir then
       return
     end
-
-    opts.container_name = opts.container_name or cfg.container_name
-    opts.build_dir = opts.build_dir or cfg.build_dir
-    opts.target = opts.target or cfg.target
   end
 
   local qf_open = false
-  -- 构建编译命令
-  local docker_command = string.format(
-    'docker exec %s bash -c "cd %s; make %s -j"',
-    opts.container_name,
-    opts.build_dir,
-    opts.target or ""
-  )
+  local command
+  if opts.container_name and opts.container_name ~= "" then
+    -- 构建 Docker 编译命令
+    command = string.format(
+      'docker exec %s bash -c "cd %s; make %s -j"',
+      opts.container_name,
+      opts.build_dir,
+      opts.target or ""
+    )
+  else
+    -- 构建本地编译命令
+    command = string.format('bash -c "cd %s; make %s -j"', opts.build_dir, opts.target or "")
+  end
 
-  print(string.format("exec cmd: %s", docker_command))
+  print(string.format("exec cmd: %s", command))
 
   -- 清空 quickfix 窗口
   vim.fn.setqflist({}, 'r')
-  state.flying_make_job_id = vim.fn.jobstart(docker_command, {
+  state.flying_make_job_id = vim.fn.jobstart(command, {
     on_exit = function(_, exit_code)
       state.flying_make_job_id = nil
       local qwinid = get_quickfix_win_id()
@@ -137,7 +146,7 @@ end
 
 -- 执行测试命令的核心函数
 local function run_test(opts)
-  if not opts.container_name or not opts.build_dir or not opts.target then
+  if not opts.build_dir or not opts.target then
     vim.notify("Missing required parameters for running test", vim.log.levels.ERROR)
     return
   end
@@ -155,12 +164,19 @@ local function run_test(opts)
   local title = string.format("Running test: %s", opts.target)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { title, string.rep("=", #title), "" })
 
-  -- 构建测试命令
-  local run_cmd = string.format(
-    'bash -c "cd %s; ctest -R %s -V"',
-    opts.build_dir,
-    opts.target
-  )
+  local run_cmd
+  if opts.container_name and opts.container_name ~= "" then
+    -- 构建 Docker 测试命令
+    run_cmd = string.format(
+      'docker exec %s bash -c "cd %s; ctest -R %s -V"',
+      opts.container_name,
+      opts.build_dir,
+      opts.target
+    )
+  else
+    -- 构建本地测试命令
+    run_cmd = string.format('bash -c "cd %s; ctest -R %s -V"', opts.build_dir, opts.target)
+  end
 
   print(string.format("exec test cmd: %s", run_cmd))
 
@@ -210,11 +226,11 @@ local function get_or_prompt_config(callback)
       return
     end
 
-    if cfg.container_name and cfg.build_dir then
+    if cfg.build_dir then
       callback(cfg)
       return
     else
-      vim.notify("Config file is missing required fields", vim.log.levels.WARN)
+      vim.notify("Config file is missing build_dir", vim.log.levels.WARN)
     end
   end
 
@@ -229,12 +245,7 @@ local function get_or_prompt_config(callback)
 
     if choice == "Create config file" then
       -- 创建配置文件
-      vim.ui.input({ prompt = "Docker container name: " }, function(container_name)
-        if not container_name or container_name == "" then
-          vim.notify("Container name is required", vim.log.levels.ERROR)
-          callback(nil)
-          return
-        end
+      vim.ui.input({ prompt = "Docker container name (optional): " }, function(container_name)
 
         vim.ui.input({ prompt = "Build directory: " }, function(build_dir)
           if not build_dir or build_dir == "" then
@@ -273,12 +284,7 @@ local function get_or_prompt_config(callback)
       end)
     elseif choice == "Enter manually" then
       -- 手动输入
-      vim.ui.input({ prompt = "Docker container name: " }, function(container_name)
-        if not container_name or container_name == "" then
-          vim.notify("Container name is required", vim.log.levels.ERROR)
-          callback(nil)
-          return
-        end
+      vim.ui.input({ prompt = "Docker container name (optional): " }, function(container_name)
 
         vim.ui.input({ prompt = "Build directory: " }, function(build_dir)
           if not build_dir or build_dir == "" then
@@ -309,7 +315,12 @@ end
 
 -- 公共函数：获取可用的测试目标列表
 local function get_test_targets(container_name, build_dir, callback)
-  local cmd = string.format("docker exec %s bash -c 'cd %s; ctest -N'", container_name, build_dir)
+  local cmd
+  if container_name and container_name ~= "" then
+    cmd = string.format("docker exec %s bash -c 'cd %s; ctest -N'", container_name, build_dir)
+  else
+    cmd = string.format("bash -c 'cd %s; ctest -N'", build_dir)
+  end
   local output = vim.fn.system(cmd)
   local exit_code = vim.v.shell_error
 
@@ -340,7 +351,12 @@ end
 
 -- 提取执行 MakeSelect 逻辑的函数
 local function execute_make_select(container_name, root_path)
-  local cmd = string.format("docker exec %s bash -c 'cd %s; cmake --build . --target help'", container_name, root_path)
+  local cmd
+  if container_name and container_name ~= "" then
+    cmd = string.format("docker exec %s bash -c 'cd %s; cmake --build . --target help'", container_name, root_path)
+  else
+    cmd = string.format("bash -c 'cd %s; cmake --build . --target help'", root_path)
+  end
   local output = vim.fn.system(cmd)
   local exit_code = vim.v.shell_error
 
